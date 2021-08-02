@@ -1,0 +1,454 @@
+---
+title: "eICE code tutorial"
+author: 
+    - "Alex Paynter (responsible for all code errors)"
+    - "Co-authors: Umer Khan, Sonya Heltshe, Christopher Goss, Noah Lechtzin, Nicole Mayer Hamblett"
+output: 
+    html_document:
+        theme: spacelab 
+        highlight: pygments
+        toc: true
+        toc_float: true 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T, include = T,
+                      message = F, warning = F)
+```
+
+
+```{r}
+library(dplyr)
+library(magrittr)
+library(lme4)
+library(broom)
+library(broom.mixed)
+library(splines)
+library(lmeresampler)
+library(ggplot2)
+library(stringr)
+```
+
+
+# Introduction
+
+This document provides demonstration code for the analytic methods discussed in "A Comparison of Clinic and Home Spirometry as Longitudinal Outcomes in Cystic Fibrosis", a submitted publication to the Journal of Cystic Fibrosis in 2021.
+
+We use artificially generated data for this tutorial (see `create_data.R`).  No actual patient data is included and the results will not match those in the paper.  The goal of this document is to maximize clarity and transparency of our analysis by walking through some of the code we used.  Please also see the much more detailed description which is provided in the paper supplement.
+
+One difference between our analysis here and the paper:  here we use Wald confidence intervals up until the MMLT method is introduced (for simplicity).  In the paper a subject-level bootstrap is used anytime we call `lmer()` here, and observation level bootstrap is sufficient for any `lm()` call.
+
+
+
+
+
+
+<br><br><br>
+
+# Data prep
+
+First some facts about the data we generated:
+
+- There is truly a cross sectional difference between home and clinic spirometry.
+- There is no average difference in the longitudinal change: -2 ppFEV1/year for both home and clinic.
+- Home collection has more severe loss to followup.
+
+```{r}
+df_home <- readr::read_csv("home.csv")
+df_clin <- readr::read_csv("clin.csv")
+```
+
+For the nearest neighbor (NN) and windowed mean (WM) methods most of the work is accomplished in merging the two data sources and creating derived variables.  Here is the code to do that from the independent home (`df_home`) and clinic (`df_clin`) data sources above:
+
+```{r}
+df_merged <- full_join(df_clin, df_home, by = "subject")
+
+# derive the 7d average around each clinic visit:
+windowed_aves <- df_merged %>% 
+    mutate(t_diff = abs(t_clin-t_home)) %>%
+    filter(t_diff <= 7) %>%
+    group_by(subject, visit_num) %>%
+    summarize(ppfev_home_7d = mean(ppfev_home), .groups = "drop") 
+
+# filter the dataframe down to have one home observation for each clinic visit:
+df_merged %<>% 
+    mutate(t_diff = abs(t_clin-t_home)) %>%
+    # keep only the closest home observation to each visit:
+    group_by(subject, visit_num) %>%
+    arrange(t_diff) %>%
+    filter(1:n() == 1) %>% 
+    ungroup()
+
+# merge in the 7d averages:
+df_merged %<>% left_join(., windowed_aves, by = c("subject", "visit_num")) %>%
+    arrange(subject, visit_num)
+
+# we'll calculate the differences for the NN and WM methods:
+df_merged %<>%
+    mutate(nn_diff = ppfev_home - ppfev_clin,
+           wm_diff = ppfev_home_7d - ppfev_clin,
+           nn_mean = (ppfev_home + ppfev_clin)/2)
+
+# for NN and WA longitudinal analyses it will be helpful to have change scores
+#   computed in advance:
+df_merged <- df_merged %>%
+    # create baseline data:
+    filter(visit_num %in% 1) %>%
+    dplyr::select(subject, bl_home = ppfev_home, bl_home_7d = ppfev_home_7d,
+                  bl_clin = ppfev_clin) %>%
+    # merge it in:
+    left_join(df_merged, ., by = "subject") %>%
+    # compute changes:
+    mutate(ppfev_home_chg = ppfev_home - bl_home,
+           ppfev_clin_chg = ppfev_clin - bl_clin,
+           ppfev_home_7d_chg = ppfev_home_7d - bl_home_7d)
+
+# remove baseline vars - we don't need them:
+df_merged %<>% select(-contains("bl_"))
+```
+
+
+
+
+
+<br><br><br>
+
+# Cross sectional methods
+
+Cross sectional method assess whether there is a systematic difference between home and clinic spirometry, especially Figure 2A.  For each we show the code and model output.
+
+## Nearest Neighbor (NN)
+
+```{r}
+lmer(data = df_merged, formula = nn_diff ~ 1 + (1|subject)) %>%
+    broom::tidy(., conf.int = T) %>%
+    filter(effect == 'fixed')
+```
+
+We will continue to make use of `broom`, but just for the sake of readers who prefer the built-in `lme4` output, note that this is equivalent to:
+
+```{r}
+summary(
+    lmer(data = df_merged, formula = nn_diff ~ 1 + (1|subject))
+)
+```
+## Windowed Mean (WM)
+
+This is exactly the same as the NN method, except we use our derived variable for the difference of a 7d average:
+
+```{r}
+lmer(data = df_merged, formula = wm_diff ~ 1 + (1|subject)) %>%
+    broom::tidy(., conf.int = T) %>%
+    filter(effect == 'fixed')
+```
+
+
+
+
+## Bland Altman
+
+Not really a statistical method - but the most common visual way to look at the cross sectional difference is a Bland Altman or mean difference plot.  We just need to compute the three lines and we're ready to make a simple plot:
+
+```{r}
+df_lines <- df_merged %>%
+    summarize(
+        bottom = mean(nn_diff, na.rm = T) - qnorm(0.975) * sd(nn_diff, na.rm = T),
+        mid = mean(nn_diff, na.rm = T),
+        top = mean(nn_diff, na.rm = T) + qnorm(0.975) * sd(nn_diff, na.rm = T)
+    ) %>%
+    tidyr::pivot_longer(cols = everything())
+
+ggplot(df_merged, aes(x = nn_mean, y = nn_diff)) +
+    geom_point(color = "#2c365e") +
+    geom_hline(data = df_lines, aes(yintercept = value), color = "#4b8f8c") +
+    geom_hline(yintercept = 0, color = "#c5979d") +
+    theme_minimal()
+```
+
+Even with a visual method we can see some signs that home spirometry looks lower than clinic spirometry.  We can also see how pretty and regular this simulated data is compared to the real thing - hopefully not a surprise but something to keep in mind when reading other work.
+
+<br><br><br>
+
+
+
+
+
+
+
+# Longitudinal Methods
+
+Longitudinal methods analyze home and clinic data as separate entities (Figure 4 in the paper).  `df_merged` will be used for NN and WA methods because those operate on a per-visit-change basis.  For IPR, MMLT and MMST we need the whole set of home data, contained in `df_home`.  `df_merged` and `df_clin` both contain the whole cinic dataset, so it doesn't matter which of those we use.
+
+Unless otherwise stated the inferences we print will be one year change estimates, also known as visit 5.
+
+## Nearest Neighbor (NN)
+
+Clinic data analysis:
+
+```{r}
+df_merged %>%
+    filter(visit_num %in% 5) %>%
+    lm(data = ., formula = ppfev_clin_chg ~ 1) %>%
+    broom::tidy(., conf.int = T)
+```
+
+Home data analysis:
+
+```{r}
+df_merged %>%
+    filter(visit_num %in% 5 & t_diff <= 7) %>% # only if a match exists in 7d
+    lm(data = ., formula = ppfev_home_chg ~ 1) %>%
+    broom::tidy(., conf.int = T)
+```
+
+
+
+
+## Windowed Mean (WM)
+
+The clinic data analysis is identical to the NN method, because there were never clinic visits within 7 days of each other.
+
+Home data analysis:
+
+```{r}
+df_merged %>%
+    filter(visit_num %in% 5 & t_diff <= 7) %>%
+    lm(data = ., formula = ppfev_home_7d_chg ~ 1) %>%
+    broom::tidy(., conf.int = T)
+```
+
+
+
+
+## Individual Participant Regressions (IPR)
+
+IPR proceeds in steps: 
+
+1. derive slopes and max followup.
+2. exclude those with less than 175d followup (or any filtering to get rid of wild slope estimates).
+3. analyze the slopes as derived variables.
+
+
+Clinic data analysis:
+
+```{r}
+# helper to get slopes:
+get_linear_slope <- function(t, y) {
+    temp_df <- tibble(t, y)
+    mod <- lm(formula = "y ~ t", data = temp_df) %>% 
+        broom::tidy(.) 
+    slope <- mod %>% dplyr::filter(term == "t") %>% dplyr::pull(estimate)
+    return(slope)
+}
+
+clin_slopes <- df_clin %>%
+    group_by(subject) %>%
+    summarize(slope = get_linear_slope(t = t_clin_yr, y = ppfev_clin),
+              follow_time = max(t_clin, na.rm = T))
+clin_slopes %<>% filter(follow_time >= 175)
+clin_slopes %>%
+    lm(data = ., formula = slope ~ 1) %>%
+    broom::tidy(., conf.int = T)
+
+```
+
+Home data analysis:
+
+
+```{r}
+# (helper function can be used again)
+home_slopes <- df_merged %>%
+    group_by(subject) %>%
+    summarize(slope = get_linear_slope(t = t_home_yr, y = ppfev_home),
+              follow_time = max(t_home, na.rm = T))
+home_slopes %>%
+    filter(follow_time >= 175) %>%
+    lm(data = ., formula = slope ~ 1) %>%
+    broom::tidy(., conf.int = T)
+```
+
+The minimum and maximum slopes before the 175d filtering were `r round(range(home_slopes$slope,na.rm = T), 1)` ppFEV1/yr.  After filtering we get down to a much more reasonable min/max of `r round(range((filter(home_slopes, follow_time > 175) %>% pull(slope)),na.rm = T), 1)` ppFEV1/yr.  Hopefully this makes it clear why we felt an arbitrary restriction is obligatory for this method.
+
+
+
+
+## Mixed Model, Linear in Time (MMLT)
+
+In this section we only show the home analysis so we can focus on the confidence interval methods.  The clinic analysis is the same using `df_clin`, `ppfev_clin` and `t_clin_yr` for all models.
+
+
+
+
+### Wald confidence intervals
+
+```{r}
+lmer(data = df_home, formula = ppfev_home ~ t_home_yr + (1|subject)) %>%
+    broom::tidy(., conf.int = T) %>%
+    filter(term %in% "t_home_yr")
+```
+
+
+
+
+### Observation-level bootstrap
+
+```{r}
+lmer(data = df_home, formula = ppfev_home ~ t_home_yr + (1|subject)) %>%
+    # sim = 1000 or higher was used in the actual code.
+    broom::tidy(., conf.int = T, conf.method = "boot", nsim = 300) %>%
+    filter(term %in% "t_home_yr")
+```
+
+And again we'll note that various observation-level options are available with `bootMer` in `lme4`, which is what `broom` is using.  As with the real data analysis, the observation level bootstrap is similar to the Wald estimates.
+
+
+
+
+### Subject-level bootstrap
+
+At the time of this writing there are some work-in-progress packages which accommodate a wide range of clustered bootstrap methods, for example `lmeresampler`.  A 
+
+```{r}
+boots <- lmer(data = df_home, formula = ppfev_home ~ t_home_yr + (1|subject)) %>%
+    lmeresampler::bootstrap(
+        # this function pulls the second fixed effect term, which is t_home_yr:
+        .f = (function(x) fixef(x)[2]),
+        type = "case", 
+        B = 300, 
+        resample = c(T,F) # sample subjects, but not observations within subjects.
+    )
+
+# Parametric bootstrap CI can be obtained from summary stats:
+boots$stats %>% (function(x) pull(x,observed) + c(-1,1) * qnorm(0.975) * pull(x,se))
+
+# Percentile method CI can be obtained with: (this is what we did)
+boots$replicates %>% (function(x) quantile(x, c(0.025, 0.975)))
+
+```
+
+Note that the confidence intervals are noticeably wider here than MMLT with a Wald method - even with data generated from normal distributions.  This is mostly the effect of cluster size, and it's considerably more pronounced with real data.
+
+The above function is convenient for linear models where we can conduct inference on a single coefficient, but we had some errors using it with the upcoming MMST method.  If we take the approach of bootstrapping the change estimates for the whole 1 year trajectory, we can generalize our approach to work with the MMST also:
+
+```{r}
+# Predict the fit for the whole 1 year trajectory - generalizes to MMST.
+pred_df <- tibble::tibble(t_home_yr = seq(0,1, by = 0.01))
+
+# An alternative to using "fixef" above, which will again help us on the MMST.
+prediction_fun <- function(fit) {
+    # to get the fitted intercept we just grab the first row:
+    intercept <- pred_df %>% dplyr::filter(t_home_yr == 0) %>%
+        predict(fit, ., re.form = NA)
+    # return the change from baseline at each time.
+    predict(fit, pred_df, re.form = NA) - intercept
+}
+
+# A helper function which does the bootstrap resampling for us:
+manual_subject_boot <- function(mod, dat, pred_function, boots) {
+    resamp_results <- list() # emply list to hold results.
+    for (j in 1:boots) {
+        ids <- dat %>% dplyr::group_by(subject) %>%
+            dplyr::group_rows(.) %>% sample(., replace = T) 
+        new_df <- tibble(
+            new_id = rep(seq_along(ids), 
+                         times = vapply(ids, length, numeric(1))),
+            row = unlist(ids)) %>%
+            dplyr::mutate(subject = stringr::str_pad(new_id, pad = "0", 
+                                                     side = 'left', width = 3))
+        resamp <- dat[new_df$row,] %>%
+            dplyr::mutate(subject = new_df$subject)
+        resamp_mod <- lmer(data = resamp,
+                           formula = mod@call) # pull the formula from the model.
+        
+        resamp_results <- c(resamp_results, list(pred_function(resamp_mod)))
+    }
+    # the output format is confusing, t has nothing to do with time.
+    #  but we're designing this for compatibility
+    # with the output bootMer makes.  
+    t <- do.call(rbind, resamp_results)
+    t0 <- pred_function(mod)
+    bb <- list(t0 = t0, t = t)
+    return(bb)
+}
+
+# A function which converts the bootstraps into the quantities we want:
+#  lci = lower confidence interval, se = standard error.
+convert_boots <- function(p_df, bb) {
+    rtn_mat <- bb$t %>%
+        apply(., MARGIN = 2, (function(x) {
+            c(quantile(x, c(0.025, 0.975)), sd(x))
+        })) %>%
+        t %>% as_tibble %>%
+        magrittr::set_colnames(., value = c("lci", "uci", "se"))
+    rtn_mat %<>%
+        dplyr::mutate(t = pull(p_df, t_home_yr), est = bb$t0) %>%
+        dplyr::select(t, est, lci, uci, se)
+    return(rtn_mat)
+}
+
+
+home_mod <- lmer(data = df_home, formula = ppfev_home ~ t_home_yr + (1|subject))
+boots_manual <- manual_subject_boot(mod = home_mod,
+                                    dat = df_home,
+                                    pred_function = prediction_fun,
+                                    boots = 300) 
+
+boots_output <- pred_df %>%
+    convert_boots(., bb = boots_manual) %>%
+    # normally we'd keep the whole trajectory for plotting,
+    #   here we just grab the 1 year change:
+    filter(t == 1)
+
+boots_output
+```
+
+It would be inappropriate to conduct inference on all times simultaneously with this method, which is why we only used them for plotting and focused on the 1-year estimates in Figure 4B.
+
+
+
+
+## MMST
+
+Now that we've laid out the method above where we bootstrap the change estimate for all `t`, changing this to accommodate a spline just comes down to updating the formula: 
+
+```{r}
+home_mod <- lmer(
+    data = df_home, 
+    formula = ppfev_home ~ ns(t_home_yr, 
+                              Boundary.knots = c(0.25, 0.75), 
+                              knots = 0.5) + (1|subject))
+boots_manual <- manual_subject_boot(mod = home_mod,
+                                    dat = df_home,
+                                    pred_function = prediction_fun,
+                                    boots = 300) 
+
+boots_output <- pred_df %>%
+    convert_boots(., bb = boots_manual) %>%
+    # normally we'd keep the whole trajectory for plotting,
+    #   here we just grab the 1 year change:
+    filter(t == 1)
+
+boots_output
+```
+
+The spline method has similar precision typically, but get the ability to pick up on non-linear population trends and apply the model to a wider range of studies with confidence.
+
+Note that ALL methods were fairly close to the truth: -2 ppFEV1/yr, but only some of them had the precision to be able to make that claim at the end of our simulation.
+
+<br><br><br>
+
+
+
+
+
+# Wrapup and production notes
+
+It's helpful to write all the above model code into functions so we can iterate over home/clinic data, variables, confidence interval methods, sensitivity analyses, etc.  We would recommend this upgrade to avoid repetitive code errors - but those details are hidden so we can get get to the stats.  Errors may have been added when deconstructing our code into a tutorial.
+
+See an error that needs to be fixed?  Email: alexcpaynter@gmail.com
+
+
+
+
+
+
